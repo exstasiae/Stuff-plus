@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Raw Statcast data (large binary files — regenerate with: python pipeline.py --steps fetch)
+data/raw/*.parquet
+data/raw/current/
+data/raw/manifest.json
+
+# Processed intermediate files (large — regenerate with: python pipeline.py --steps preprocess features aggregate)
+data/processed/statcast_clean.parquet
+data/processed/statcast_features.parquet
+# statcast_aggregated.parquet is small (4 MB) and enables prediction without full retraining;
+# uncomment the line below if you prefer a fully reproducible-from-scratch repo:
+# data/processed/statcast_aggregated.parquet
+
+# Editor / tool settings
+.vscode/
+.idea/
+.claude/
+
+# macOS
+.DS_Store

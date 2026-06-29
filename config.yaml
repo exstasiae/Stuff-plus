@@ -1,0 +1,229 @@
+# ─────────────────────────────────────────────
+#  Stuff+ Model — Central Configuration
+# ─────────────────────────────────────────────
+
+paths:
+  raw_data:       data/raw
+  processed_data: data/processed
+  models:         models
+  outputs:        outputs
+  manifest:       data/raw/manifest.json   # tracks what seasons have been cached
+
+seasons:
+  # 2021+ = modern pitching era: sweeper proliferation, higher average velocities,
+  # and full Hawk-Eye optical tracking (more accurate than 2017-2019 Trackman).
+  # Pre-2021 data introduces era drift — a 97 mph fastball graded differently
+  # in 2018 than in 2024. Restricting to 5 seasons keeps the model calibrated
+  # to current pitching philosophy.
+  train: [2021, 2022, 2023, 2024, 2025]
+  current: 2026   # handled as incremental monthly chunks
+
+# ── Pitch type groupings ─────────────────────────────────────────────────────
+# Used for DATA FILTERING only (preprocess + aggregate metadata).
+# Models are NOT trained at group level — see model_pitch_types below.
+pitch_groups:
+  fastball:  ["FF", "SI", "FC"]
+  breaking:  ["SL", "CU", "KC", "SV", "ST"]
+  offspeed:  ["CH", "FS", "FO"]
+
+# ── Per-pitch-type model registry ─────────────────────────────────────────────
+# One XGBoost model is trained for each pitch type listed here.
+# A cutter (FC) is only compared to other cutters; a sweeper (ST) to sweepers.
+#
+# standard   — ≥300 rows expected; use standard hyperparameters
+# small      — <300 rows expected; use extra-regularised hyperparameters
+model_pitch_types:
+  standard: ["FF", "SI", "SL", "CH", "CU", "FC", "ST"]
+  small:    ["FS", "KC", "SV"]
+
+# ── Raw Statcast columns to keep after fetch ──
+# Keeping only these reduces Parquet file size and load time further.
+keep_columns:
+  identifiers:
+    - game_date
+    - game_pk
+    - pitcher
+    - player_name
+    - batter
+    - inning
+    - inning_topbot
+    - at_bat_number
+    - pitch_number
+    - pitch_type
+    - pitch_name
+
+  pitch_characteristics:
+    - release_speed           # velocity (mph)
+    - pfx_x                   # horizontal movement vs. straight line (inches, catcher's POV)
+    - pfx_z                   # vertical movement vs. straight line (inches)
+    - release_spin_rate       # spin (rpm)
+    - spin_axis               # spin axis (degrees, 0-360)
+    - release_pos_x           # release point x (ft, catcher's POV)
+    - release_pos_y           # release point distance from rubber (ft)
+    - release_pos_z           # release point height (ft)
+    - release_extension       # how far toward plate pitcher releases (ft)
+    - plate_x                 # horizontal location at plate (ft, catcher's POV)
+    - plate_z                 # vertical location at plate (ft)
+    - vx0                     # velocity vector components at release
+    - vy0
+    - vz0
+    - ax                      # acceleration components
+    - ay
+    - az
+
+  target_and_outcomes:
+    - delta_run_exp           # kept as reference column; no longer the model target
+    - estimated_woba_using_speedangle
+    - launch_speed
+    - launch_angle
+    - events
+    - description             # swing, called_strike, ball, etc.
+    - type                    # S / B / X (strike / ball / in-play)
+    - zone                    # strike zone location (1-14)
+    - balls
+    - strikes
+
+  context:
+    - stand                   # batter handedness (L/R)
+    - p_throws                # pitcher handedness (L/R)
+    - if_fielding_alignment
+    - of_fielding_alignment
+
+# ── Feature engineering ───────────────────────
+features:
+  # These are the final engineered features fed to the model.
+  # Raw Statcast + derived features computed in src/features/engineer.py
+  # All inputs are pure pitch-physics features measured at release or in flight.
+  # plate_x / plate_z are intentionally EXCLUDED — those encode command/location,
+  # not stuff quality. Including them penalises pitchers with poor command
+  # (e.g. a 102 mph pitcher who misses his spots gets dragged down unfairly).
+  model_inputs:
+    # ── Raw physics (absolute values) ──────────────────────────────────────────
+    # These give the model the "true" pitch physics independent of era context.
+    - release_speed
+    - pfx_x
+    - pfx_z
+    - induced_vertical_break  # pfx_z adjusted for gravity (engineered)
+    - horz_break              # pfx_x in signed inches (engineered)
+    - release_spin_rate
+    - spin_axis
+    - release_pos_x
+    - release_pos_z
+    - release_extension
+    - vaa                     # vertical approach angle (engineered)
+    - haa                     # horizontal approach angle (engineered)
+    - speed_diff              # mph slower than pitcher's own fastball (engineered)
+    - p_throws_enc            # pitcher handedness encoded (0/1)
+
+    # ── Within-type z-scores (relative values) ─────────────────────────────────
+    # Each feature z-scored within (pitch_type × season): z = (x − μ) / σ
+    # A 98 mph FF in 2021 was +1.2σ; in 2025 it's +0.3σ.  The z-score is
+    # era-stable.  With per-pitch-type models these are the primary "how elite
+    # is this characteristic relative to peers?" signal.
+    - z_release_speed
+    - z_pfx_x
+    - z_pfx_z
+    - z_induced_vertical_break
+    - z_release_spin_rate
+    - z_vaa
+    - z_release_extension
+    - z_horz_break
+    - z_speed_diff
+
+    # ── Spin & release-point quality ───────────────────────────────────────────
+    # spin_efficiency: fraction of spin creating useful Magnus force (0=gyro, 1=pure Magnus)
+    # z_spin_efficiency: era-stable within-type z-score of the above
+    # release_consistency: RMS std dev of release point x/z across pitches (ft); lower=better
+    - spin_efficiency
+    - z_spin_efficiency
+    - release_consistency
+
+    # ── Tunneling ──────────────────────────────────────────────────────────────
+    # tunnel_dist_nearest: distance (ft) at the decision point to the nearest
+    #   other pitch type in the pitcher's arsenal.  Lower = pitches look
+    #   more similar = harder for the batter to read.
+    # z_tunnel_dist_nearest: within-type era-stable z-score of the above.
+    # tunnel_ratio_nearest: (plate separation) / (tunnel separation) for the
+    #   nearest pair.  Higher = pitches look the same at decision but diverge
+    #   more at the plate = greater deception after commitment.
+    # z_tunnel_ratio_nearest: within-type era-stable z-score of the above.
+    # NaN for pitchers who threw only one pitch type (XGBoost handles natively).
+    - tunnel_dist_nearest
+    - z_tunnel_dist_nearest
+    - tunnel_ratio_nearest
+    - z_tunnel_ratio_nearest
+
+# lw_run_value is computed in preprocess.py from description + estimated_woba.
+# It is NOT a raw Statcast column — do not add it to keep_columns above.
+target: lw_run_value
+
+# ── Data quality filters ──────────────────────
+# Applied during preprocessing to remove position players and bad sensor reads.
+preprocessing:
+  min_pitches_per_season: 100   # drop pitcher-seasons with fewer pitches than this
+
+# ── Aggregation ───────────────────────────────
+# After feature engineering, pitch-level data is aggregated to
+# pitcher-season-pitch_type level before training. This dramatically
+# reduces noise: 719 individual Misiorowski fastballs → 1 row with
+# his average physics profile and average outcome.
+aggregation:
+  min_pitches_per_type: 50    # min pitches of a specific type in a season to include
+
+  # Columns to z-score within each (pitch_type × season) bucket.
+  # Added to the aggregated DataFrame immediately after aggregation.
+  # Do NOT include categorical/binary columns (spin_axis, p_throws_enc, etc.)
+  zscore_columns:
+    - release_speed
+    - pfx_x
+    - pfx_z
+    - induced_vertical_break
+    - release_spin_rate
+    - vaa
+    - release_extension
+    - horz_break
+    - speed_diff
+    - spin_efficiency        # era-stable: league avg efficiency shifts slightly over time
+    - tunnel_dist_nearest   # era-stable: average tunnel separation has shifted as pitches evolved
+    - tunnel_ratio_nearest  # dimensionless ratio benefits from within-era normalisation
+
+# ── XGBoost hyperparameters ───────────────────────────────────────────────────
+# Two param sets selected automatically at training time based on row count.
+#
+# standard    — used when a pitch type has ≥ 150 rows (FF, SL, SI, CH, CU, FC, ST)
+# small_sample — used when < 150 rows (FS, KC, SV); extra regularisation prevents
+#               overfitting on thin data
+#
+# Both sets use pitch-count sample weights (n_pitches per row), so
+# min_child_weight is the minimum sum of pitch counts per leaf, not row count.
+xgboost:
+  standard:
+    n_estimators: 400
+    max_depth: 4
+    learning_rate: 0.03
+    subsample: 0.8
+    colsample_bytree: 0.8
+    min_child_weight: 200    # equiv. to ~1 average pitcher's season of signal per leaf
+    reg_alpha: 0.1
+    reg_lambda: 2.0
+    tree_method: hist
+    eval_metric: rmse
+
+  small_sample:
+    n_estimators: 200
+    max_depth: 3             # shallower to prevent overfitting
+    learning_rate: 0.05
+    subsample: 0.8
+    colsample_bytree: 0.8
+    min_child_weight: 50     # relaxed — fewer pitches total in these types
+    reg_alpha: 0.3           # stronger feature regularisation
+    reg_lambda: 4.0          # stronger weight regularisation
+    tree_method: hist
+    eval_metric: rmse
+
+# ── Normalization ─────────────────────────────
+# After predicting raw run values, scale to a + metric:
+#   100 = league average, 110 = 10% better than average, etc.
+normalization:
+  center: 100
+  scale: 10        # 1 std dev above average = 110
